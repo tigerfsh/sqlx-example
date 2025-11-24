@@ -108,27 +108,37 @@ async fn main() -> Result<()> {
     create_table(&pool).await?;
     info!("用户表创建/检查完成");
 
-    // 2. 插入数据（使用事务确保提交）
+    // 2. 插入数据（使用事务确保提交，失败时回滚）
     let user_id = {
         let mut transaction = pool.begin().await?;
         info!("开始事务插入用户");
-
+        
         let username = generate_random_username();
         let email = generate_random_email();
-        let result = sqlx::query(INSERT_USER_SQL)
-            .bind(username)
-            .bind(email)
+        
+        match sqlx::query(INSERT_USER_SQL)
+            .bind(&username)
+            .bind(&email)
             .execute(&mut *transaction)
-            .await?;
-
-        let user_id = result.last_insert_id();
-        info!("事务中插入用户成功 - ID: {}", user_id);
-
-        // 提交事务
-        transaction.commit().await?;
-        info!("事务提交成功");
-
-        user_id
+            .await
+        {
+            Ok(result) => {
+                let user_id = result.last_insert_id();
+                info!("事务中插入用户成功 - ID: {}", user_id);
+                
+                // 提交事务
+                transaction.commit().await?;
+                info!("事务提交成功");
+                
+                user_id
+            }
+            Err(e) => {
+                error!("插入用户失败: {}", e);
+                transaction.rollback().await?;
+                error!("事务已回滚");
+                return Err(e.into());
+            }
+        }
     };
     info!("插入用户成功，ID: {}", user_id);
 
@@ -152,7 +162,7 @@ async fn main() -> Result<()> {
         warn!("未找到ID为 {} 的用户", user_id);
     }
 
-    // 5. 更新操作 - 只更新邮箱（使用事务确保提交）
+    // 5. 更新操作 - 只更新邮箱（使用事务确保提交，失败时回滚）
     if let Some(user) = select_user_by_id(&pool, user_id).await? {
         let new_email = format!("updated_{}", user.email);
         
@@ -160,26 +170,34 @@ async fn main() -> Result<()> {
             let mut transaction = pool.begin().await?;
             info!("开始事务更新用户邮箱");
             
-            sqlx::query(UPDATE_USER_SQL)
+            match sqlx::query(UPDATE_USER_SQL)
                 .bind(&new_email)
                 .bind(user_id)
                 .execute(&mut *transaction)
-                .await?;
-            
-            transaction.commit().await?;
-            info!("事务提交成功");
-        }
-        
-        info!("更新用户邮箱成功 - ID: {}, 新邮箱: {}", user_id, new_email);
-        
-        // 验证更新
-        if let Some(updated_user) = select_user_by_id(&pool, user_id).await? {
-            info!("更新后的用户 - ID: {}, 用户名: {}, 邮箱: {}",
-                updated_user.id, updated_user.username, updated_user.email);
+                .await
+            {
+                Ok(_) => {
+                    transaction.commit().await?;
+                    info!("事务提交成功");
+                    info!("更新用户邮箱成功 - ID: {}, 新邮箱: {}", user_id, new_email);
+                    
+                    // 验证更新
+                    if let Some(updated_user) = select_user_by_id(&pool, user_id).await? {
+                        info!("更新后的用户 - ID: {}, 用户名: {}, 邮箱: {}",
+                            updated_user.id, updated_user.username, updated_user.email);
+                    }
+                }
+                Err(e) => {
+                    error!("更新用户邮箱失败: {}", e);
+                    transaction.rollback().await?;
+                    error!("事务已回滚");
+                    return Err(e.into());
+                }
+            }
         }
     }
 
-    // 6. 删除操作 - 删除最早写入的用户（使用事务确保提交）
+    // 6. 删除操作 - 删除最早写入的用户（使用事务确保提交，失败时回滚）
     if let Some(oldest_user) = find_oldest_user(&pool).await? {
         info!("找到最早的用户 - ID: {}, 用户名: {}, 邮箱: {}",
             oldest_user.id, oldest_user.username, oldest_user.email);
@@ -188,21 +206,68 @@ async fn main() -> Result<()> {
             let mut transaction = pool.begin().await?;
             info!("开始事务删除用户");
             
-            sqlx::query(DELETE_USER_SQL)
+            match sqlx::query(DELETE_USER_SQL)
                 .bind(oldest_user.id)
                 .execute(&mut *transaction)
-                .await?;
-            
-            transaction.commit().await?;
-            info!("事务提交成功");
+                .await
+            {
+                Ok(_) => {
+                    transaction.commit().await?;
+                    info!("事务提交成功");
+                    info!("删除最早用户成功 - ID: {}", oldest_user.id);
+                }
+                Err(e) => {
+                    error!("删除用户失败: {}", e);
+                    transaction.rollback().await?;
+                    error!("事务已回滚");
+                    return Err(e.into());
+                }
+            }
         }
-        
-        info!("删除最早用户成功 - ID: {}", oldest_user.id);
     } else {
         warn!("未找到可删除的用户");
     }
 
-    // 7. 最终验证 - 查询所有数据确认数据持久化
+    // 7. 事务回滚测试 - 故意插入重复邮箱来演示回滚
+    info!("开始事务回滚测试...");
+    {
+        let mut transaction = pool.begin().await?;
+        info!("开始事务 - 故意插入重复邮箱");
+        
+        // 获取当前用户列表
+        let current_users = select_all_users(&pool).await?;
+        if let Some(existing_user) = current_users.first() {
+            // 故意使用重复的邮箱来触发唯一约束错误
+            let duplicate_email = &existing_user.email;
+            let new_username = generate_random_username();
+            
+            info!("尝试插入重复邮箱: {}", duplicate_email);
+            
+            match sqlx::query(INSERT_USER_SQL)
+                .bind(&new_username)
+                .bind(duplicate_email)
+                .execute(&mut *transaction)
+                .await
+            {
+                Ok(_) => {
+                    // 这不应该发生，因为邮箱是唯一的
+                    transaction.commit().await?;
+                    warn!("意外成功插入重复邮箱，这不应该发生");
+                }
+                Err(e) => {
+                    error!("插入重复邮箱失败 (预期行为): {}", e);
+                    transaction.rollback().await?;
+                    info!("事务已成功回滚 - 数据一致性得到保证");
+                    
+                    // 验证数据没有变化
+                    let users_after_rollback = select_all_users(&pool).await?;
+                    info!("回滚后用户数量: {} (与之前相同)", users_after_rollback.len());
+                }
+            }
+        }
+    }
+
+    // 8. 最终验证 - 查询所有数据确认数据持久化
     info!("最终验证 - 查询数据库中的所有用户:");
     let final_users = select_all_users(&pool).await?;
     info!("数据库中实际存在的用户数量: {}", final_users.len());
@@ -213,7 +278,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    info!("SQLx MySQL 示例程序执行完成");
+    info!("SQLx MySQL 示例程序执行完成 - 所有事务操作（包括回滚测试）已完成");
     Ok(())
 }
 
