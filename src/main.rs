@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
 
     // 从环境变量获取数据库URL，如果没有设置则使用默认值
     let database_url = env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:Fsh_2021@localhost:3306/airflow".to_string());
+        .unwrap_or_else(|_| "mysql://root:password@localhost:3306/testdb".to_string());
 
     info!("连接数据库: {}", database_url);
 
