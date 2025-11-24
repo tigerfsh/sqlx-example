@@ -1,9 +1,11 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use rand::{Rng, distributions::Alphanumeric, thread_rng};
+use rand::{seq::SliceRandom};
 use serde::{Deserialize, Serialize};
-use sqlx::{mysql::MySqlPoolOptions, MySql, Pool};
+use sqlx::{MySql, Pool, mysql::MySqlPoolOptions};
 use std::env;
-use tracing::{debug, error, info, instrument, warn, Level};
+use tracing::{Level, debug, error, info, instrument, warn};
 
 // 用户表结构
 #[derive(Debug, Serialize, Deserialize, sqlx::FromRow)]
@@ -43,13 +45,14 @@ SELECT id, username, email, created_at, updated_at FROM users WHERE id = ?
 
 // 更新用户的SQL
 const UPDATE_USER_SQL: &str = r#"
-UPDATE users SET username = ?, email = ? WHERE id = ?
+UPDATE users SET email = ? WHERE id = ?
 "#;
 
 // 删除用户的SQL
 const DELETE_USER_SQL: &str = r#"
 DELETE FROM users WHERE id = ?
 "#;
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,7 +66,7 @@ async fn main() -> Result<()> {
 
     // 从环境变量获取数据库URL，如果没有设置则使用默认值
     let database_url = env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "mysql://root:password@localhost:3306/testdb".to_string());
+        .unwrap_or_else(|_| "mysql://root:Fsh_2021@localhost:3306/airflow".to_string());
 
     info!("连接数据库: {}", database_url);
 
@@ -80,7 +83,7 @@ async fn main() -> Result<()> {
         Err(e) => {
             error!("数据库连接失败: {}", e);
             error!("尝试禁用 SSL/TLS 连接...");
-            
+
             // 尝试禁用 SSL 连接
             let database_url_no_ssl = format!("{}?ssl-mode=disabled", database_url);
             match MySqlPoolOptions::new()
@@ -105,54 +108,122 @@ async fn main() -> Result<()> {
     create_table(&pool).await?;
     info!("用户表创建/检查完成");
 
-    // 2. 插入数据
-    let user_id = insert_user(&pool, "张三", "zhangsan@example.com").await?;
+    // 2. 插入数据（使用事务确保提交）
+    let user_id = {
+        let mut transaction = pool.begin().await?;
+        info!("开始事务插入用户");
+
+        let username = generate_random_username();
+        let email = generate_random_email();
+        let result = sqlx::query(INSERT_USER_SQL)
+            .bind(username)
+            .bind(email)
+            .execute(&mut *transaction)
+            .await?;
+
+        let user_id = result.last_insert_id();
+        info!("事务中插入用户成功 - ID: {}", user_id);
+
+        // 提交事务
+        transaction.commit().await?;
+        info!("事务提交成功");
+
+        user_id
+    };
     info!("插入用户成功，ID: {}", user_id);
 
     // 3. 查询所有数据
     let users = select_all_users(&pool).await?;
     info!("查询到 {} 个用户", users.len());
     for user in &users {
-        debug!("用户详情 - ID: {}, 用户名: {}, 邮箱: {}, 创建时间: {}, 更新时间: {}",
-            user.id, user.username, user.email, user.created_at, user.updated_at);
+        debug!(
+            "用户详情 - ID: {}, 用户名: {}, 邮箱: {}, 创建时间: {}, 更新时间: {}",
+            user.id, user.username, user.email, user.created_at, user.updated_at
+        );
     }
 
     // 4. 根据ID查询数据
     if let Some(user) = select_user_by_id(&pool, user_id).await? {
-        info!("根据ID查询用户成功 - ID: {}, 用户名: {}, 邮箱: {}", user.id, user.username, user.email);
+        info!(
+            "根据ID查询用户成功 - ID: {}, 用户名: {}, 邮箱: {}",
+            user.id, user.username, user.email
+        );
     } else {
         warn!("未找到ID为 {} 的用户", user_id);
+    }
+
+    // 5. 更新操作 - 只更新邮箱（使用事务确保提交）
+    if let Some(user) = select_user_by_id(&pool, user_id).await? {
+        let new_email = format!("updated_{}", user.email);
+        
+        {
+            let mut transaction = pool.begin().await?;
+            info!("开始事务更新用户邮箱");
+            
+            sqlx::query(UPDATE_USER_SQL)
+                .bind(&new_email)
+                .bind(user_id)
+                .execute(&mut *transaction)
+                .await?;
+            
+            transaction.commit().await?;
+            info!("事务提交成功");
+        }
+        
+        info!("更新用户邮箱成功 - ID: {}, 新邮箱: {}", user_id, new_email);
+        
+        // 验证更新
+        if let Some(updated_user) = select_user_by_id(&pool, user_id).await? {
+            info!("更新后的用户 - ID: {}, 用户名: {}, 邮箱: {}",
+                updated_user.id, updated_user.username, updated_user.email);
+        }
+    }
+
+    // 6. 删除操作 - 删除最早写入的用户（使用事务确保提交）
+    if let Some(oldest_user) = find_oldest_user(&pool).await? {
+        info!("找到最早的用户 - ID: {}, 用户名: {}, 邮箱: {}",
+            oldest_user.id, oldest_user.username, oldest_user.email);
+        
+        {
+            let mut transaction = pool.begin().await?;
+            info!("开始事务删除用户");
+            
+            sqlx::query(DELETE_USER_SQL)
+                .bind(oldest_user.id)
+                .execute(&mut *transaction)
+                .await?;
+            
+            transaction.commit().await?;
+            info!("事务提交成功");
+        }
+        
+        info!("删除最早用户成功 - ID: {}", oldest_user.id);
+    } else {
+        warn!("未找到可删除的用户");
+    }
+
+    // 7. 最终验证 - 查询所有数据确认数据持久化
+    info!("最终验证 - 查询数据库中的所有用户:");
+    let final_users = select_all_users(&pool).await?;
+    info!("数据库中实际存在的用户数量: {}", final_users.len());
+    for user in &final_users {
+        info!(
+            "最终用户数据 - ID: {}, 用户名: {}, 邮箱: {}",
+            user.id, user.username, user.email
+        );
     }
 
     info!("SQLx MySQL 示例程序执行完成");
     Ok(())
 }
 
-
 // 创建用户表
 #[instrument]
 async fn create_table(pool: &Pool<MySql>) -> Result<()> {
     info!("开始创建用户表");
-    sqlx::query(CREATE_USER_TABLE_SQL)
-        .execute(pool)
-        .await?;
+    sqlx::query(CREATE_USER_TABLE_SQL).execute(pool).await?;
     info!("用户表创建成功");
     Ok(())
-}
-
-// 插入用户
-#[instrument]
-async fn insert_user(pool: &Pool<MySql>, username: &str, email: &str) -> Result<u64> {
-    info!("开始插入用户 - 用户名: {}, 邮箱: {}", username, email);
-    let result = sqlx::query(INSERT_USER_SQL)
-        .bind(username)
-        .bind(email)
-        .execute(pool)
-        .await?;
-
-    let user_id = result.last_insert_id();
-    info!("用户插入成功 - ID: {}", user_id);
-    Ok(user_id)
 }
 
 // 查询所有用户
@@ -174,7 +245,7 @@ async fn select_user_by_id(pool: &Pool<MySql>, id: u64) -> Result<Option<User>> 
         .bind(id)
         .fetch_optional(pool)
         .await?;
-    
+
     if user.is_some() {
         debug!("找到用户 - ID: {}", id);
     } else {
@@ -183,42 +254,40 @@ async fn select_user_by_id(pool: &Pool<MySql>, id: u64) -> Result<Option<User>> 
     Ok(user)
 }
 
-// 更新用户
-#[instrument]
-async fn update_user(pool: &Pool<MySql>, id: u64, username: &str, email: &str) -> Result<()> {
-    info!("开始更新用户 - ID: {}, 新用户名: {}, 新邮箱: {}", id, username, email);
-    sqlx::query(UPDATE_USER_SQL)
-        .bind(username)
-        .bind(email)
-        .bind(id)
-        .execute(pool)
-        .await?;
-    info!("用户更新成功 - ID: {}", id);
-    Ok(())
+fn generate_random_username() -> String {
+    let mut rng = thread_rng();
+    let username: String = (&mut rng)
+        .sample_iter(Alphanumeric)
+        .filter(|c| c.is_ascii_alphabetic())
+        .map(char::from)
+        .take(10)
+        .collect();
+    username
 }
 
-// 删除用户
-#[instrument]
-async fn delete_user(pool: &Pool<MySql>, id: u64) -> Result<()> {
-    info!("开始删除用户 - ID: {}", id);
-    sqlx::query(DELETE_USER_SQL)
-        .bind(id)
-        .execute(pool)
-        .await?;
-    info!("用户删除成功 - ID: {}", id);
-    Ok(())
+fn generate_random_email() -> String {
+    let username = generate_random_username().to_lowercase();
+    let domains = ["example.com", "test.com", "mail.com", "demo.org"];
+
+    let mut rng = thread_rng();
+    let domain = domains.choose(&mut rng).unwrap_or(&"example.com");
+    format!("{}@{}", username, domain)
 }
 
-// 在事务中删除用户
+// 查找最早的用户
 #[instrument]
-async fn delete_user_in_transaction(transaction: &mut sqlx::Transaction<'_, MySql>, id: u64) -> Result<()> {
-    info!("在事务中删除用户 - ID: {}", id);
-    sqlx::query(DELETE_USER_SQL)
-        .bind(id)
-        .execute(&mut **transaction)
+async fn find_oldest_user(pool: &Pool<MySql>) -> Result<Option<User>> {
+    debug!("查找最早的用户");
+    let oldest_user = sqlx::query_as::<_, User>("SELECT * FROM users ORDER BY created_at ASC LIMIT 1")
+        .fetch_optional(pool)
         .await?;
-    info!("事务中用户删除成功 - ID: {}", id);
-    Ok(())
+    
+    if oldest_user.is_some() {
+        debug!("找到最早的用户");
+    } else {
+        debug!("未找到用户");
+    }
+    Ok(oldest_user)
 }
 
 // 简单的测试函数

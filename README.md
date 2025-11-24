@@ -107,6 +107,30 @@ struct User {
 3. 根据实际情况修改数据库连接信息
 4. 表结构会自动创建，无需手动建表
 
+## 数据持久化说明
+
+### 事务处理
+
+程序使用显式事务来确保数据持久化：
+
+```rust
+let mut transaction = pool.begin().await?;
+// 执行数据库操作
+transaction.commit().await?;
+```
+
+### 常见问题
+
+1. **数据未持久化**：如果使用普通连接执行插入操作，数据可能在程序退出后丢失
+2. **主键自增**：即使插入失败，MySQL的AUTO_INCREMENT计数器也会增加
+3. **事务提交**：必须显式调用 `transaction.commit()` 才能保存数据
+
+### 解决方案
+
+- 使用事务确保数据一致性
+- 显式提交事务
+- 在程序结束时验证数据持久化
+
 ## 日志系统
 
 项目使用 `tracing` 库提供结构化日志，包含以下日志级别：
@@ -121,7 +145,7 @@ struct User {
 日志系统在程序启动时自动初始化：
 ```rust
 tracing_subscriber::fmt()
-    .with_max_level(Level::DEBUG)
+    .with_max_level(Level::INFO)
     .with_target(false)
     .init();
 ```
